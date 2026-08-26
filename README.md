@@ -1,5 +1,5 @@
 # ThreeBody-Sim
-A ThreeBody simluation apps based on taichi
+A ThreeBody simulation apps based on taichi
 
 # RUN ThreeBody-sim
 

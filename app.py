@@ -110,15 +110,17 @@ class ThreeBodyUniverse:
         """按时间倍率推进物理，并维护尾迹环形缓冲
 
         每帧基准模拟时长固定（0.06 模拟秒 @ speed=1）：步数按配置
-        dt 归一，近碰撞特解用更细 dt（如 2e-4）时自动加密步数，
-        时间流速与手感在不同配置间保持一致。
+        dt 归一。含近碰撞的特解（cfg['adaptive']）用 step_adaptive
+        在近距时自动加密子步（远距用满步长，速度与精度兼得）。
         """
         if self.paused:
             return
         steps = int(round(60.0 * self.speed * 0.001 / self.dt))
         steps = max(1, min(steps, 1200))
+        step_fn = (self.sys.step_adaptive if self.cfg.get('adaptive')
+                   else self.sys.step)
         for _ in range(steps):
-            self.sys.step(self.dt)
+            step_fn(self.dt)
             self.trails.step(self.dt, self.sys.pos.astype(np.float32))
 
     # ------------------------------------------------------------------ draw

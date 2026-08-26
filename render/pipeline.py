@@ -2,6 +2,7 @@
 
 渲染管线（调用顺序见 app.ThreeBodyUniverse.render）：
     render_scene   背景 + 三恒星精确求交 + 逐像素表面 + 解析日冕辉光
+                   + 临边日珥 + 潮汐等离子桥（effects）
     splat_trails   尾迹线段光栅化（HDR 原子叠加）
     bloom_down     亮部提取 + 4x box 降采样
     bloom_blur_h/v 可分离高斯（1/4 分辨率）
@@ -20,7 +21,8 @@ import taichi as ti
 from .background import _bg_color
 from .context import (BLOOM_SIGMA, GLOW_IN_AMP, GLOW_IN_SIG,
                       GLOW_OUT_AMP, GLOW_OUT_SIG)
-from .noise import _aces, _vmix
+from .effects import _prominence, _tidal_bridge
+from .noise import _aces, _sstep, _vmix
 from .star_surface import _star_surface
 from .state import (cam_fov_f, cam_look_f, cam_pos_f, star_gain_f,
                     star_pos_f, star_rad_f, star_tints, trail_cnt,
@@ -114,24 +116,37 @@ def render_scene(t: ti.f32):
             n = (p - star_pos_f[hit_k]).normalized()
             col = _star_surface(hit_k, n, rd, t)
 
-        # --- 解析日冕辉光（未命中处也累加；被前方天体遮挡则衰减） ---
+        # --- 解析日冕辉光（未命中处也累加；被前景天体遮挡则衰减） ---
+        # bf = 前向距离（>0 = 星体在相机前方；历史版本此处符号写反，
+        # 导致辉光只出现在相机背后的星体上、前方星体无辉光，已修正）
         for k in ti.static(range(3)):
             oc = cam - star_pos_f[k]
-            b = oc.dot(rd)
-            if b > 0.0:
-                d2 = oc.dot(oc) - b * b            # 射线到星心距离的平方
+            bf = -oc.dot(rd)
+            if bf > 0.0:
+                d2 = oc.dot(oc) - bf * bf        # 射线到星心距离的平方
                 r = star_rad_f[k]
+                rho2 = d2 / (r * r)
+                # 自遮挡：盘内不叠加辉光（日冕相对光球极弱，避免洗白表面），
+                # 临边 0.93r~r 平滑过渡，星缘外壳保持完整
+                self_vis = _sstep(0.86, 1.0, rho2)
                 vis = 1.0
-                if hit_k >= 0 and hit_k != k and t_min < b - r:
-                    vis = 0.0                      # 辉光中心被前方天体挡住
+                if hit_k >= 0 and hit_k != k and t_min < bf - r:
+                    vis = 0.0                    # 辉光中心被前方天体挡住
                 s_in = r * GLOW_IN_SIG
                 s_out = r * GLOW_OUT_SIG
                 # 内晕偏白热（色球/散射），外晕保持星色调（日冕）
                 c_in = _vmix(star_tints[k], ti.Vector([1.0, 1.0, 1.0]), 0.45)
-                col += c_in * (GLOW_IN_AMP * ti.exp(-d2 / (s_in * s_in) * 3.0)
-                               * vis * star_gain_f[k])
-                col += star_tints[k] * (GLOW_OUT_AMP * ti.exp(-d2 / (s_out * s_out))
-                                        * vis * star_gain_f[k])
+                col += c_in * (GLOW_IN_AMP
+                               * ti.exp(-d2 / (s_in * s_in) * 3.0)
+                               * vis * self_vis * star_gain_f[k])
+                col += star_tints[k] * (GLOW_OUT_AMP
+                                        * ti.exp(-d2 / (s_out * s_out))
+                                        * vis * self_vis * star_gain_f[k])
+                # 临边日珥（仅环带像素有非零贡献）
+                col += _prominence(k, t, bf, d2, r, hit_k, t_min, cam, rd)
+
+        # --- 潮汐等离子桥（仅双星近距时激活） ---
+        col += _tidal_bridge(t, hit_k, t_min, cam, rd)
 
         img_hdr[x, y] = col
 
