@@ -32,9 +32,10 @@ class CameraRig:
         self.zoom_r = 1.0               # 电影模式环绕半径缩放（推拉）
         self._elev_off = 0.0            # 拖拽附加的俯仰偏移（弧度）
         self._drag_pos = None           # 拖拽中上一帧光标（归一化坐标）
-        # GUI 面板占用的区域（归一化 x/y 上界，左上原点）：该区域内
-        # 不触发拖拽转向，避免与控件操作冲突；由 app.draw_gui 同步。
-        self.gui_zone = (0.28, 0.79)
+        # GUI 面板占用的矩形列表 [(x0, y0, x1, y1)]（归一化，左上原点）：
+        # 这些区域内不触发拖拽转向，避免与控件操作冲突；
+        # 由 app.draw_gui 每帧按实际布局同步（窗口变形时可能多列）。
+        self.gui_zones = [(0.0, 0.0, 0.29, 0.80)]
 
     # ------------------------------------------------------------------ api
 
@@ -77,19 +78,19 @@ class CameraRig:
     def _steer(self, window):
         """电影模式下按住左键拖拽转动视角（方位 + 俯仰偏移）。
 
-        光标坐标为窗口归一化坐标（原点左上、y 向下），与 GUI 子窗口同一
-        约定；拖拽方向与主流轨道控件一致（拖右场景右转，拖下相机升高）。
-        self.gui_zone 所围区域（GUI 面板）不触发拖拽，避免与控件冲突；
-        面板布局变化时由 app.draw_gui 每帧同步该属性。
-        离屏窗口不支持光标查询，直接跳过。
-        """
+光标坐标为窗口归一化坐标（原点左上、y 向下），与 GUI 子窗口同一
+约定；拖拽方向与主流轨道控件一致（拖右场景右转，拖下相机升高）。
+self.gui_zones 所围区域（GUI 面板）不触发拖拽，避免与控件冲突；
+面板布局变化时由 app.draw_gui 每帧同步该列表。
+离屏窗口不支持光标查询，直接跳过。
+"""
         try:
             x, y = window.get_cursor_pos()
         except RuntimeError:
             self._drag_pos = None
             return
-        zx, zy = self.gui_zone
-        in_gui = x < zx and y < zy
+        in_gui = any(z[0] <= x <= z[2] and z[1] <= y <= z[3]
+                     for z in self.gui_zones)
         if window.is_pressed(ti.ui.LMB) and not in_gui:
             if self._drag_pos is not None:
                 dx = x - self._drag_pos[0]

@@ -18,6 +18,8 @@ star_rad_f = ti.field(ti.f32, shape=3)
 star_tints = ti.Vector.field(3, ti.f32, shape=3)
 star_seeds = ti.Vector.field(3, ti.f32, shape=3)   # 每星种子：噪声偏移/自转倾角/转速
 star_gain_f = ti.field(ti.f32, shape=3)            # 每星亮度增益（按色调亮度归一）
+star_mass_f = ti.field(ti.f32, shape=3)            # 质量（透镜：R_s = 2m/c²）
+star_type_f = ti.field(ti.i32, shape=3)            # 天体类型（physics.TYPE_*）
 
 # ---- 尾迹（环形展开后上传，前 trail_cnt 个有效） ----
 trail_pts = ti.Vector.field(3, ti.f32, shape=(3, TAIL_MAX))

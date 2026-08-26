@@ -2,7 +2,7 @@
 
 渲染管线（调用顺序见 app.ThreeBodyUniverse.render）：
     render_scene   背景 + 三恒星精确求交 + 逐像素表面 + 解析日冕辉光
-                   + 临边日珥 + 潮汐等离子桥（effects）
+                   + 临边日珥 + 接触融合辉光（effects）
     splat_trails   尾迹线段光栅化（HDR 原子叠加）
     bloom_down     亮部提取 + 4x box 降采样
     bloom_blur_h/v 可分离高斯（1/4 分辨率）
@@ -19,14 +19,14 @@ kernel 必须写在同一模块，外部只能以 `render.pipeline.img_tex` 这�
 import taichi as ti
 
 from .background import _bg_color
-from .context import (BLOOM_SIGMA, GLOW_IN_AMP, GLOW_IN_SIG,
-                      GLOW_OUT_AMP, GLOW_OUT_SIG)
-from .effects import _prominence, _tidal_bridge
+from .context import (BLOOM_SIGMA, C_INV_LIGHT2, LENS_CUT, TYPE_BH, TYPE_NS)
+from .effects import (_contact_glow, _corona_glow, _photon_march,
+                      _photon_ring, _weak_deflect)
 from .noise import _aces, _sstep, _vmix
 from .star_surface import _star_surface
-from .state import (cam_fov_f, cam_look_f, cam_pos_f, star_gain_f,
-                    star_pos_f, star_rad_f, star_tints, trail_cnt,
-                    trail_pts)
+from .state import (cam_fov_f, cam_look_f, cam_pos_f, star_mass_f,
+                    star_pos_f, star_rad_f, star_tints, star_type_f,
+                    trail_cnt, trail_pts)
 
 # ---- 图像缓冲（按窗口分辨率一次性分配，经 ensure_fields 初始化） ----
 IMG_W = 0
@@ -84,69 +84,91 @@ def _project(p: ti.template(), cam: ti.template(), fwd: ti.template(),
     return px, py, z
 
 
+@ti.func
+def _ray_stars(cam: ti.template(), rd: ti.template()):
+    """射线-球求交（rd 已归一化）-> (最近命中距离 t_min, 星号 hit_k)。"""
+    t_min = 1e30
+    hit_k = -1
+    for k in ti.static(range(3)):
+        oc = cam - star_pos_f[k]
+        b = oc.dot(rd)
+        c0 = oc.dot(oc) - star_rad_f[k] * star_rad_f[k]
+        disc = b * b - c0
+        if disc > 0.0:
+            th = -b - ti.sqrt(disc)
+            if th > 0.0 and th < t_min:
+                t_min = th
+                hit_k = k
+    return t_min, hit_k
+
+
 @ti.kernel
 def render_scene(t: ti.f32):
-    """主渲染：背景 + 三恒星精确求交 + 逐像素表面 + 解析日冕辉光 -> img_hdr。"""
+    """主渲染：背景 + 恒星求交着色 + 日冕辉光/日珥/融合辉光 + 引力透镜。
+
+    无致密天体（NS/BH）时走原直射线管线（与历史版本逐位一致）；
+    有则启用透镜：撞击参数 < LENS_CUT·R_s 的像素逐段积分弯曲光线
+    （恒星表面/吸积盘/视界都在弯曲路径上求交，透镜后的背景沿
+    出射方向采样 —— 背景星场随引力弯曲成爱因斯坦环），其余像素
+    用解析弱偏折弯折采样方向。两条透镜路径在边界处偏折量相等，
+    无缝衔接；bh_front 用于把黑洞后方的恒星辉光从阴影里扣除。
+    """
     cam, fwd, right, up = _camera_basis()
     tanh = ti.tan(cam_fov_f[0] * 0.008726646)    # tan(fov/2)，运行时可调
     aspect = IMG_W / IMG_H
+    lens = 0
+    for k in ti.static(range(3)):
+        if star_type_f[k] >= TYPE_NS and star_rad_f[k] > 0.01:
+            lens = 1
     for x, y in img_hdr:
         sx = (2.0 * (x + 0.5) / IMG_W - 1.0) * tanh * aspect
         sy = (2.0 * (y + 0.5) / IMG_H - 1.0) * tanh
         rd = (fwd + right * sx + up * sy).normalized()
 
-        col = _bg_color(rd)
-
-        # --- 射线-球求交（rd 已归一化） ---
-        t_min = 1e30
-        hit_k = -1
-        for k in ti.static(range(3)):
-            oc = cam - star_pos_f[k]
-            b = oc.dot(rd)
-            c0 = oc.dot(oc) - star_rad_f[k] * star_rad_f[k]
-            disc = b * b - c0
-            if disc > 0.0:
-                th = -b - ti.sqrt(disc)
-                if th > 0.0 and th < t_min:
-                    t_min = th
-                    hit_k = k
-
-        if hit_k >= 0:
-            p = cam + rd * t_min
-            n = (p - star_pos_f[hit_k]).normalized()
-            col = _star_surface(hit_k, n, rd, t)
-
-        # --- 解析日冕辉光（未命中处也累加；被前景天体遮挡则衰减） ---
-        # bf = 前向距离（>0 = 星体在相机前方；历史版本此处符号写反，
-        # 导致辉光只出现在相机背后的星体上、前方星体无辉光，已修正）
-        for k in ti.static(range(3)):
-            oc = cam - star_pos_f[k]
-            bf = -oc.dot(rd)
-            if bf > 0.0:
-                d2 = oc.dot(oc) - bf * bf        # 射线到星心距离的平方
-                r = star_rad_f[k]
-                rho2 = d2 / (r * r)
-                # 自遮挡：盘内不叠加辉光（日冕相对光球极弱，避免洗白表面），
-                # 临边 0.93r~r 平滑过渡，星缘外壳保持完整
-                self_vis = _sstep(0.86, 1.0, rho2)
-                vis = 1.0
-                if hit_k >= 0 and hit_k != k and t_min < bf - r:
-                    vis = 0.0                    # 辉光中心被前方天体挡住
-                s_in = r * GLOW_IN_SIG
-                s_out = r * GLOW_OUT_SIG
-                # 内晕偏白热（色球/散射），外晕保持星色调（日冕）
-                c_in = _vmix(star_tints[k], ti.Vector([1.0, 1.0, 1.0]), 0.45)
-                col += c_in * (GLOW_IN_AMP
-                               * ti.exp(-d2 / (s_in * s_in) * 3.0)
-                               * vis * self_vis * star_gain_f[k])
-                col += star_tints[k] * (GLOW_OUT_AMP
-                                        * ti.exp(-d2 / (s_out * s_out))
-                                        * vis * self_vis * star_gain_f[k])
-                # 临边日珥（仅环带像素有非零贡献）
-                col += _prominence(k, t, bf, d2, r, hit_k, t_min, cam, rd)
-
-        # --- 潮汐等离子桥（仅双星近距时激活） ---
-        col += _tidal_bridge(t, hit_k, t_min, cam, rd)
+        col = ti.Vector([0.0, 0.0, 0.0])
+        rdb = rd                       # 实际采样/求交方向（弱偏折后）
+        bh_front = 1e30                # 前方最近致密天体的前向距离
+        done = False
+        if lens == 1:
+            march = False
+            for k in ti.static(range(3)):
+                if star_type_f[k] >= TYPE_NS and star_rad_f[k] > 0.01:
+                    oc = star_pos_f[k] - cam
+                    proj = oc.dot(rd)
+                    if proj > 0.0:
+                        bv = oc - rd * proj
+                        b2 = bv.norm()
+                        rs = 2.0 * star_mass_f[k] * C_INV_LIGHT2
+                        if b2 < LENS_CUT * rs:
+                            march = True
+                        if b2 < 2.5 * LENS_CUT * rs:
+                            bh_front = min(bh_front, proj)
+            if march:
+                # ---- 近场：测地线积分（表面/盘/视界均在弯曲路径上） ----
+                col, T, code, hit_k, esc = _photon_march(cam, rd, t)
+                if code == 0:
+                    # 逃逸：沿出射方向补背景 + 光子环（均被前景盘衰减）
+                    col += T * (_bg_color(esc) + _photon_ring(cam, rd))
+                if code != 2:
+                    col += _corona_glow(cam, rd, hit_k, 1e30, t, bh_front)
+                    col += _contact_glow(t, hit_k, 1e30, cam, rd)
+                else:
+                    # 捕获：阴影纯黑（前方恒星辉光仍可见）
+                    col += _corona_glow(cam, rd, -1, 1e30, t, bh_front)
+                done = True
+            else:
+                # ---- 远场：解析弱偏折（背景/星像/辉光沿弯折方向） ----
+                rdb = _weak_deflect(cam, rd)
+        if not done:
+            # ---- 直射管线（无致密天体时与历史版本逐位一致） ----
+            col = _bg_color(rdb)
+            t_min, hit_k = _ray_stars(cam, rdb)
+            if hit_k >= 0:
+                p = cam + rdb * t_min
+                n = (p - star_pos_f[hit_k]).normalized()
+                col = _star_surface(hit_k, n, rdb, t)
+            col += _corona_glow(cam, rdb, hit_k, t_min, t, bh_front)
+            col += _contact_glow(t, hit_k, t_min, cam, rdb)
 
         img_hdr[x, y] = col
 
@@ -157,15 +179,31 @@ def splat_trails():
 
     性能：Taichi 只自动并行最外层 range 循环。若以 k 星循环作外层，
     整个 GPU 仅 3 个线程串行处理上千条线段（曾是主要瓶颈），因此把
-    (k, i) 展平成一维 range 统一调度。
+    (k, i) 展平成一维 range 统一调度。每星段数独立（并合熄灭的星
+    计数为 0，自动不参与绘制）。
     """
     cam, fwd, right, up = _camera_basis()
     tanh = ti.tan(cam_fov_f[0] * 0.008726646)
     aspect = IMG_W / IMG_H
-    nseg = trail_cnt[0] - 1
-    for s in range(3 * nseg):
-        k = s // nseg
-        i = s - k * nseg
+    c0 = max(trail_cnt[0] - 1, 0)
+    c1 = max(trail_cnt[1] - 1, 0)
+    c2 = max(trail_cnt[2] - 1, 0)
+    for s in range(c0 + c1 + c2):
+        k = 0
+        i = 0
+        nseg = c0
+        if s < c0:
+            k = 0
+            i = s
+            nseg = c0
+        elif s < c0 + c1:
+            k = 1
+            i = s - c0
+            nseg = c1
+        else:
+            k = 2
+            i = s - c0 - c1
+            nseg = c2
         tint = star_tints[k]
         p0 = trail_pts[k, i]
         p1 = trail_pts[k, i + 1]
@@ -198,7 +236,23 @@ def splat_trails():
                         d2 = (u - x0) ** 2 + (v - y0) ** 2
                     w = ti.exp(-d2 / (2.0 * 1.3 * 1.3))
                     if w > 0.004:
-                        ti.atomic_add(img_hdr[u, v], col * w)
+                        # 黑洞阴影遮罩：尾迹是屏幕空间直线绘制，落入
+                        # 阴影（且位于黑洞后方）的段应被吞没，否则会
+                        # 漂在纯黑阴影上。阴影角半径 ≈ 2.6·R_s/距离。
+                        zmid = 0.5 * (z0 + z1)
+                        for k in ti.static(range(3)):
+                            if star_type_f[k] == TYPE_BH and star_rad_f[k] > 0.01:
+                                bx, by, bz = _project(
+                                    star_pos_f[k], cam, fwd, right, up,
+                                    tanh, aspect)
+                                if bz > 0.02 and zmid > bz:
+                                    rpx = (2.598 * star_rad_f[k] / bz) \
+                                        / tanh * (0.5 * IMG_H)
+                                    dd = ti.sqrt((u - bx) ** 2
+                                                 + (v - by) ** 2)
+                                    w *= _sstep(0.92 * rpx, 1.30 * rpx, dd)
+                        if w > 0.004:
+                            ti.atomic_add(img_hdr[u, v], col * w)
 
 
 @ti.kernel
