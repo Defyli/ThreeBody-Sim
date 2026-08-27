@@ -25,8 +25,91 @@ from .context import (C_INV_LIGHT2, DISK_AMP, DISK_IN, DISK_OUT, DISK_SPIN,
                       RING_AMP, RING_R, RING_W, TYPE_BH, TYPE_NS)
 from .noise import _fbm3, _sstep, _vmix, _vnoise
 from .star_surface import _star_surface
-from .state import (star_gain_f, star_mass_f, star_pos_f, star_rad_f,
-                    star_seeds, star_tints, star_type_f)
+from .state import (fuse_i, fuse_j, fuse_n, lens_k, lens_n, n_body_f,
+                    scr_bb, star_gain_f, star_mass_f, star_pos_f,
+                    star_rad_f, star_seeds, star_stretch_f, star_axis_f,
+                    star_tints, star_type_f)
+
+
+# ------------------------------------------------------------ 天体几何
+#
+# 潮汐变形：拉伸天体按旋转椭球求交（长轴沿潮汐轴 star_axis_f，
+# 半轴 (r·f, r/√f, r/√f)，体积守恒）；f < 1.02 时退化为纯球路径
+#（与历史版本逐位一致）。射线在潮汐轴正交基下分解后按椭球度量
+# 解二次方程，解的参数即世界距离 t（缩放只作用于坐标分量）。
+
+@ti.func
+def _axis_basis(ax: ti.template()):
+    """与潮汐轴 ax 正交的两个单位向量 e2/e3"""
+    ref = ti.Vector([0.0, 0.0, 1.0])
+    if ti.abs(ax.z) > 0.9:
+        ref = ti.Vector([1.0, 0.0, 0.0])
+    e2 = ax.cross(ref).normalized()
+    e3 = ax.cross(e2)
+    return e2, e3
+
+
+@ti.func
+def _body_hit_t(k: ti.i32, o: ti.template(), d: ti.template()) -> ti.f32:
+    """射线-天体求交（o/d 为射线原点与单位方向）-> 世界距离 t（未命中 -1）。
+
+    支持潮汐拉伸椭球；死星（半径 0）恒不命中。直射与透镜
+    （测地线积分段内）两条路径共用。
+    """
+    r = star_rad_f[k]
+    t_hit = -1.0
+    if r > 0.01:
+        rel = o - star_pos_f[k]
+        f = star_stretch_f[k]
+        if f < 1.02:
+            b = rel.dot(d)
+            c0 = rel.dot(rel) - r * r
+            disc = b * b - c0
+            if disc > 0.0:
+                th = -b - ti.sqrt(disc)
+                if th > 1e-6:
+                    t_hit = th
+        else:
+            sa = r * f                       # 长半轴（沿潮汐轴）
+            sb = r / ti.sqrt(f)              # 短半轴（体积守恒）
+            ax = star_axis_f[k]
+            e2, e3 = _axis_basis(ax)
+            ox = rel.dot(ax)
+            oy = rel.dot(e2)
+            oz = rel.dot(e3)
+            dx = d.dot(ax)
+            dy = d.dot(e2)
+            dz = d.dot(e3)
+            ia = 1.0 / (sa * sa)
+            ib = 1.0 / (sb * sb)
+            A = ia * dx * dx + ib * (dy * dy + dz * dz)
+            B = 2.0 * (ia * ox * dx + ib * (oy * dy + oz * dz))
+            C = ia * ox * ox + ib * (oy * oy + oz * oz) - 1.0
+            disc = B * B - 4.0 * A * C
+            if disc > 0.0 and A > 1e-12:
+                th = (-B - ti.sqrt(disc)) / (2.0 * A)
+                if th > 1e-6:
+                    t_hit = th
+    return t_hit
+
+
+@ti.func
+def _body_normal(k: ti.i32, p: ti.template()):
+    """天体 k 表面世界点 p 处的外法线（椭球广义）。"""
+    rel = p - star_pos_f[k]
+    f = star_stretch_f[k]
+    r = star_rad_f[k]
+    n = rel.normalized()            # 球面法线（轻微拉伸时的近似）
+    if f >= 1.02:                   # 椭球广义法线（梯度方向）
+        sa = r * f
+        sb = r / ti.sqrt(f)
+        ax = star_axis_f[k]
+        e2, e3 = _axis_basis(ax)
+        nx = rel.dot(ax) / (sa * sa)
+        ny = rel.dot(e2) / (sb * sb)
+        nz = rel.dot(e3) / (sb * sb)
+        n = (ax * nx + e2 * ny + e3 * nz).normalized()
+    return n
 
 
 @ti.func
@@ -91,72 +174,86 @@ def _contact_glow(t: ti.f32, hit_k: ti.i32, t_min: ti.f32,
     盘接触时表面亮度接管、分离较远时暗缝隙属自然分离，唯
     d/rs≈CTR 的“贴近未融合”区间填充最强（实测凹槽最深处）。
     遮挡按包层 σ 纵深平滑。
+
+    近距星对由 CPU 每帧筛选上传（fuse_*，≤MAX_FUSE 对）：N 体时
+    O(N²) 逐对扫描对每像素过重，而真正有可见贡献的近距离星对
+    通常寥寥无几。
     """
     col = ti.Vector([0.0, 0.0, 0.0])
-    for i in ti.static(range(3)):
-        for j in ti.static(range(i + 1, 3)):
-            if star_rad_f[i] > 0.01 and star_rad_f[j] > 0.01:
-                a = star_pos_f[i]
-                b = star_pos_f[j]
-                u = b - a
-                d = u.norm()
-                rs = star_rad_f[i] + star_rad_f[j]
-                drs = d / rs
-                act = ti.exp(-((drs - FUSE_CTR) / FUSE_WID) ** 2)
-                if act > FUSE_CUT:
-                    un = u / d
-                    w = cam - a
-                    wr = rd.dot(w)
-                    wu = un.dot(w)
-                    bb = rd.dot(un)
-                    denom = 1.0 - bb * bb
-                    # 射线与连线（无穷直线）最近点参数
-                    tr = (wu * bb - wr) / max(denom, 1e-6)
-                    s = wu + tr * bb               # 连线参数（世界单位）
-                    s = max(0.0, min(d, s))
-                    q = a + un * s                 # 连线一侧最近点
-                    t2 = rd.dot(q - cam)           # 射线一侧参数
-                    if t2 > 0.02:
-                        dist2 = (cam + rd * t2 - q).norm_sqr()
-                        sig = (FUSE_SIG0 + FUSE_SIG1 * act) * rs
-                        prof = ti.exp(-dist2 / (2.0 * sig * sig))
-                        if prof > 0.004:
-                            # 纵向：两星心之间均匀，两端 0.5rs 渐出
-                            fade_in = _sstep(0.0, 0.5 * rs, s)
-                            fade_out = 1.0 - _sstep(d - 0.5 * rs, d, s)
-                            span = fade_in * fade_out
-                            if span > 0.0:
-                                vis = 1.0
-                                if hit_k >= 0:
-                                    # 包层有 σ 纵深：在星缘处平滑浮现/没入
-                                    vis = _occl_frac(t_min, t2, sig)
-                                if vis > 0.0:
-                                    # 弥散包层的微弱丝缕
-                                    fil = 0.86 + 0.28 * _vnoise(
-                                        q + 0.10 * t * un)
-                                    c = _vmix(star_tints[i], star_tints[j], 0.5)
-                                    c = _vmix(c, ti.Vector([1.0, 1.0, 1.0]),
-                                              0.40)
-                                    g = 0.5 * (star_gain_f[i]
-                                               + star_gain_f[j])
-                                    col += c * (FUSE_AMP * act * act * span
-                                                * prof * fil * g * vis)
+    for p in range(fuse_n[0]):
+        i = fuse_i[p]
+        j = fuse_j[p]
+        if star_rad_f[i] > 0.01 and star_rad_f[j] > 0.01:
+            a = star_pos_f[i]
+            b = star_pos_f[j]
+            u = b - a
+            d = u.norm()
+            rs = star_rad_f[i] + star_rad_f[j]
+            drs = d / rs
+            act = ti.exp(-((drs - FUSE_CTR) / FUSE_WID) ** 2)
+            if act > FUSE_CUT:
+                un = u / d
+                w = cam - a
+                wr = rd.dot(w)
+                wu = un.dot(w)
+                bb = rd.dot(un)
+                denom = 1.0 - bb * bb
+                # 射线与连线（无穷直线）最近点参数
+                tr = (wu * bb - wr) / max(denom, 1e-6)
+                s = wu + tr * bb               # 连线参数（世界单位）
+                s = max(0.0, min(d, s))
+                q = a + un * s                 # 连线一侧最近点
+                t2 = rd.dot(q - cam)           # 射线一侧参数
+                if t2 > 0.02:
+                    dist2 = (cam + rd * t2 - q).norm_sqr()
+                    sig = (FUSE_SIG0 + FUSE_SIG1 * act) * rs
+                    prof = ti.exp(-dist2 / (2.0 * sig * sig))
+                    if prof > 0.004:
+                        # 纵向：两星心之间均匀，两端 0.5rs 渐出
+                        fade_in = _sstep(0.0, 0.5 * rs, s)
+                        fade_out = 1.0 - _sstep(d - 0.5 * rs, d, s)
+                        span = fade_in * fade_out
+                        if span > 0.0:
+                            vis = 1.0
+                            if hit_k >= 0:
+                                # 包层有 σ 纵深：在星缘处平滑浮现/没入
+                                vis = _occl_frac(t_min, t2, sig)
+                            if vis > 0.0:
+                                # 弥散包层的微弱丝缕
+                                fil = 0.86 + 0.28 * _vnoise(
+                                    q + 0.10 * t * un)
+                                c = _vmix(star_tints[i], star_tints[j], 0.5)
+                                c = _vmix(c, ti.Vector([1.0, 1.0, 1.0]),
+                                          0.40)
+                                g = 0.5 * (star_gain_f[i]
+                                           + star_gain_f[j])
+                                col += c * (FUSE_AMP * act * act * span
+                                            * prof * fil * g * vis)
     return col
 
 
 @ti.func
 def _corona_glow(cam: ti.template(), rd: ti.template(), hit_k: ti.i32,
-                 t_min: ti.f32, t: ti.f32, bh_front: ti.f32):
+                 t_min: ti.f32, t: ti.f32, bh_front: ti.f32,
+                 px: ti.f32, py: ti.f32):
     """解析日冕辉光 + 临边日珥（沿射线累积；自 pipeline 移入，
     供直射与透镜两条路径共用）。
 
     bh_front：透镜模式下该射线前方最近致密天体的前向距离 ——
     位于其后的恒星辉光会被黑洞吞没（阴影内不应透出背后的光晕）；
     直射模式传 1e30（不启用）。黑洞自身无日冕，跳过。
+
+    性能：N 体时逐像素 O(N) 的辉光/日珥是最大热点 —— CPU 每帧
+    预投影每体屏幕包围盒（scr_bb，覆盖盘∪辉光截断范围），像素
+    在盒外直接跳过该体全部计算。截断半径按 gamma 1/2.2 编码后
+    不可见标定（见 app._BB_GLOW）—— 按线性域估计会低估暗部台阶
+    （1e-3 线性经 gamma ≈ 10/255，曾表现为 NS 光晕的方形轮廓）。
     """
     col = ti.Vector([0.0, 0.0, 0.0])
-    for k in ti.static(range(3)):
-        if star_rad_f[k] > 0.01 and star_type_f[k] != TYPE_BH:
+    for k in range(n_body_f[0]):
+        if star_rad_f[k] > 0.01 and star_type_f[k] != TYPE_BH \
+                and px >= scr_bb[k, 0] and px <= scr_bb[k, 2] \
+                and py >= scr_bb[k, 1] and py <= scr_bb[k, 3]:
             oc = cam - star_pos_f[k]
             bf = -oc.dot(rd)
             if bf > 0.0 and bf < bh_front:
@@ -194,10 +291,12 @@ def _weak_deflect(cam: ti.template(), rd: ti.template()):
     弱场 GR 偏折角 α = 4Gm/(c²b) = 2R_s/b 的精确值；逐个致密天体
     顺序应用（小角叠加）。仅处理撞击参数 > LENS_CUT·R_s 的贡献
     —— 更近的像素由 _photon_march 全程积分，边界处两法偏折量
-    相等，无缝衔接。
+    相等，无缝衔接。致密天体经 lens_* 紧凑列表遍历（N 体碎片
+    化后绝大多数槽位是 MS 碎块，与透镜无关）。
     """
     d = rd
-    for k in ti.static(range(3)):
+    for q in range(lens_n[0]):
+        k = lens_k[q]
         if star_type_f[k] >= TYPE_NS and star_rad_f[k] > 0.01:
             oc = star_pos_f[k] - cam
             proj = oc.dot(d)
@@ -276,7 +375,8 @@ def _photon_ring(cam: ti.template(), rd: ti.template()):
     （避免逐像素多圈混沌采样闪烁），内缘（俘获边界侧）略强。
     """
     col = ti.Vector([0.0, 0.0, 0.0])
-    for k in ti.static(range(3)):
+    for q in range(lens_n[0]):
+        k = lens_k[q]
         if star_type_f[k] >= TYPE_NS and star_rad_f[k] > 0.01:
             rs = 2.0 * star_mass_f[k] * C_INV_LIGHT2
             oc = star_pos_f[k] - cam
@@ -321,18 +421,21 @@ def _photon_march(cam: ti.template(), rd: ti.template(), t: ti.f32):
     hit_k = -1
     esc = rd
     running = True
+    nl = lens_n[0]                 # 致密天体紧凑列表（march 内 5 处循环共用）
     for _ in range(LENS_STEPS):
         if running:
             # ---- 步长：按最近致密天体距离自适应 ----
             rmin = 1e9
-            for k in ti.static(range(3)):
-                if star_type_f[k] >= TYPE_NS and star_rad_f[k] > 0.01:
+            for qn in range(nl):
+                k = lens_k[qn]
+                if star_rad_f[k] > 0.01:
                     rmin = min(rmin, (p - star_pos_f[k]).norm())
             h = min(max(0.22 * rmin, LENS_HMIN), LENS_HMAX)
             q = p + d * h
 
             # ---- 段内吸积盘穿越（BH；盘面过星心 z=star_z，法线 ẑ）----
-            for k in ti.static(range(3)):
+            for ql in range(nl):
+                k = lens_k[ql]
                 if star_type_f[k] == TYPE_BH and star_rad_f[k] > 0.01:
                     zk = star_pos_f[k].z
                     if (p.z - zk) * (q.z - zk) < 0.0:
@@ -347,34 +450,30 @@ def _photon_march(cam: ti.template(), rd: ti.template(), t: ti.f32):
                             col += T * e * a
                             T *= 1.0 - a
 
-            # ---- 恒星表面求交（BH 无表面）----
+            # ---- 恒星表面求交（BH 无表面；含潮汐拉伸椭球；全体天体）----
             hk = -1
             t_hit = h + 1e-9
-            for k in ti.static(range(3)):
-                if star_type_f[k] < TYPE_BH and star_rad_f[k] > 0.01:
-                    oc = p - star_pos_f[k]
-                    b = oc.dot(d)
-                    c0 = oc.dot(oc) - star_rad_f[k] * star_rad_f[k]
-                    disc = b * b - c0
-                    if disc > 0.0:
-                        th = -b - ti.sqrt(disc)
-                        if th > 1e-6 and th < t_hit:
-                            t_hit = th
-                            hk = k
+            for k in range(n_body_f[0]):
+                if star_type_f[k] < TYPE_BH:
+                    th = _body_hit_t(k, p, d)
+                    if th > 1e-6 and th < t_hit:
+                        t_hit = th
+                        hk = k
 
             if hk >= 0:
                 # 命中恒星表面（不透明；前景盘已衰减 T）
                 hit_k = hk
                 if T > 0.015:
                     ph = p + d * t_hit
-                    n = (ph - star_pos_f[hk]) / star_rad_f[hk]
+                    n = _body_normal(hk, ph)
                     col += T * _star_surface(hk, n, d, t)
                     code = 1
                 running = False
             else:
                 # ---- 视界捕获 ----
                 captured = False
-                for k in ti.static(range(3)):
+                for ql in range(nl):
+                    k = lens_k[ql]
                     if star_type_f[k] == TYPE_BH and star_rad_f[k] > 0.01:
                         rr = (p - star_pos_f[k]).norm()
                         if rr < 1.02 * star_rad_f[k]:
@@ -387,9 +486,9 @@ def _photon_march(cam: ti.template(), rd: ti.template(), t: ti.f32):
                     # 超出 LENS_ESC·R_s —— 接近中或仍在近场则继续积分
                     acc = ti.Vector([0.0, 0.0, 0.0])
                     escaped = True
-                    for k in ti.static(range(3)):
-                        if star_type_f[k] >= TYPE_NS \
-                           and star_rad_f[k] > 0.01:
+                    for ql in range(nl):
+                        k = lens_k[ql]
+                        if star_rad_f[k] > 0.01:
                             w = star_pos_f[k] - p
                             rr = max(w.norm(), 1e-4)
                             rs = 2.0 * star_mass_f[k] * C_INV_LIGHT2

@@ -1,13 +1,20 @@
-"""程序化深空背景着色（ti.func）。
+"""程序化深空背景着色（ti.func）+ 低频全景烘焙。
 
-银河（窄亮脊 + 宽盘 + 核球 + 尘埃暗隙 + 未解析恒星颗粒星流）
-+ 发射星云（IQ 双层域扭曲 fbm + 脊状丝缕，H-alpha/OIII 双色调）
-+ 三个远方旋涡星系 + 双层彩色星场（亮星带十字衍射芒）。
+银河（窄亮脊 + 宽盘 + 核球 + 尘埃暗隙）+ 发射星云（IQ 双层域扭曲
+fbm）+ 三个远方旋涡星系都是方向空间的低频函数，且相机平移不改变
+（无穷远）—— 启动时烘焙到等距圆柱全景图（bg_pan），逐像素双线性
+采样替代每帧 ~20 次值噪声（~160 次整数哈希）求值。星场两层保留
+程序式：星点需保持锐利（烘焙分辨率扛不住 sigma≈0.0006 rad 的远
+层星点），且成本仅 ~10 次哈希。
 """
 
 import taichi as ti
 
+from . import context                     # noqa: F401  保证 ti.init 先于 field 分配
 from .noise import _fbm3, _hash_i, _sstep, _vmix, _vnoise
+
+BG_W, BG_H = 2048, 1024                   # 全景图分辨率（4:2 比例覆盖全天球）
+bg_pan = ti.Vector.field(3, ti.f32, shape=(BG_W, BG_H))
 
 
 @ti.func
@@ -45,13 +52,8 @@ def _galaxy(rd: ti.template(), c: ti.template(), rad: ti.f32, incl: ti.f32,
 
 
 @ti.func
-def _bg_color(rd: ti.template()):
-    """程序化深空背景。
-
-    银河（窄亮脊 + 宽盘 + 核球 + 尘埃暗隙 + 未解析恒星颗粒星流）
-    + 发射星云（IQ 双层域扭曲 fbm + 脊状丝缕，H-alpha/OIII 双色调）
-    + 三个远方旋涡星系 + 双层彩色星场（亮星带十字衍射芒）。
-    """
+def _bg_diffuse(rd: ti.template()):
+    """背景低频部分（银河 + 尘埃暗隙 + 发射星云 + 远方星系）—— 烘焙源。"""
     # ---------- 银河坐标（axis = 银道面法线，e2 方向为银心） ----------
     axis = ti.Vector([0.34, 0.62, 0.71]).normalized()
     a0 = axis.cross(ti.Vector([1.0, 0.0, 0.0]))
@@ -110,7 +112,25 @@ def _bg_color(rd: ti.template()):
                    0.040, 0.25, 3.0, 5.5, 4.0, 0.030) * g_att
     col += _galaxy(rd, ti.Vector([0.35, -0.75, -0.55]).normalized(),
                    0.100, 1.40, 2.0, 3.0, 0.6, 0.034) * g_att
+    return col
 
+
+@ti.func
+def _bg_stars(rd: ti.template()):
+    """星场两层（亮星带十字衍射芒 + 远层密星）—— 逐像素程序式（保持锐利）。
+
+    银道面亮度调制用解析带函数（便宜）；尘埃暗隙的乘性遮蔽只在烘焙
+    图内体现（对星点省略，视觉差异不可察）。
+    """
+    axis = ti.Vector([0.34, 0.62, 0.71]).normalized()
+    a0 = axis.cross(ti.Vector([1.0, 0.0, 0.0]))
+    e1 = a0.normalized()
+    e2 = axis.cross(e1)
+    lat2 = rd.dot(axis) ** 2
+    band_n = ti.exp(-lat2 / 0.0045)
+    band_w = ti.exp(-lat2 / 0.085)
+
+    col = ti.Vector([0.0, 0.0, 0.0])
     # ---------- 星场近层（亮星，黑体色渐变 + 衍射芒） ----------
     K = 150.0
     p = rd * K
@@ -139,7 +159,6 @@ def _bg_color(rd: ti.template()):
         big_gain = ti.select(is_big, 3.2, 1.0)
         sigma = ti.select(is_big, 0.0026, 0.0011)  # 角半径
         lum = bright * big_gain * (1.0 + 1.5 * band_w)
-        lum *= 1.0 - 0.55 * rift_m           # 尘埃遮蔽背景恒星
         col += c * (lum * ti.exp(-(d * d) / (sigma * sigma)))
         if is_big:
             # 十字衍射芒（沿银河坐标轴的两条细长高斯）
@@ -168,3 +187,50 @@ def _bg_color(rd: ti.template()):
         col += ti.Vector([0.80, 0.86, 1.0]) \
             * (lum2 * ti.exp(-(dd * dd) / (0.0006 * 0.0006)))
     return col
+
+
+@ti.kernel
+def _bake_panorama():
+    """启动时烘焙低频背景到等距圆柱全景图（一次，之后逐帧 O(1) 采样）。"""
+    for u, v in bg_pan:
+        az = (u + 0.5) / BG_W * 6.2831853 - 3.14159265
+        el = (v + 0.5) / BG_H * 3.14159265 - 1.5707963
+        ce = ti.cos(el)
+        rd = ti.Vector([ce * ti.cos(az), ti.sin(el), ce * ti.sin(az)])
+        bg_pan[u, v] = _bg_diffuse(rd)
+
+
+_bake_panorama()          # 无穷远背景与相机平移无关，进程内烘焙一次
+
+
+@ti.func
+def _bg_sample(rd: ti.template()):
+    """全景图双线性采样（经度方向环绕，纬度方向钳位）。"""
+    az = ti.atan2(rd.z, rd.x)                  # [-pi, pi]
+    u = az * 0.15915494 + 0.5                  # -> (0, 1]
+    el = ti.asin(max(-1.0, min(1.0, rd.y)))
+    v = el * 0.31830989 + 0.5                  # -> [0, 1]
+    fu = u * BG_W - 0.5
+    fv = v * BG_H - 0.5
+    i0 = int(ti.floor(fu))
+    j0 = int(ti.floor(fv))
+    tx = fu - i0
+    ty = fv - j0
+    if i0 < 0:                                 # 经度环绕（az=-pi 与 az=pi 相接）
+        i0 += BG_W
+    i1 = i0 + 1
+    if i1 >= BG_W:
+        i1 = 0
+    if j0 < 0:                                 # 纬度钳位（极点）
+        j0 = 0
+    j1 = j0 + 1
+    if j1 >= BG_H:
+        j1 = BG_H - 1
+    return _vmix(_vmix(bg_pan[i0, j0], bg_pan[i1, j0], tx),
+                 _vmix(bg_pan[i0, j1], bg_pan[i1, j1], tx), ty)
+
+
+@ti.func
+def _bg_color(rd: ti.template()):
+    """程序化深空背景 = 烘焙低频全景 + 程序式星场。"""
+    return _bg_sample(rd) + _bg_stars(rd)

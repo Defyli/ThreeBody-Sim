@@ -6,13 +6,19 @@
 
 import taichi as ti
 
-from physics import C_LIGHT2, TYPE_BH, TYPE_MS, TYPE_NS, TYPE_WD
+from physics import C_LIGHT2, MAX_BODIES, TYPE_BH, TYPE_MS, TYPE_NS, TYPE_WD
 
 ti.init(arch=ti.gpu)
 
 RES = (1600, 1000)          # 窗口分辨率（像素，须为 4 的倍数）
-TAIL_MAX = 4000             # 尾迹环形缓冲容量（点数）
+TAIL_MAX = 4000             # 尾迹环形缓冲容量（点数，每星）
 FOV_DEG = 50.0              # 视场角默认值（运行时可经 GUI / 按键调整）
+MAX_LENS = 8                # 致密天体（NS/BH）compact 列表容量（透镜/阴影）
+MAX_PART = 3072             # 事件粒子容量（撕裂喷发/碎片蒸发/并合溅射）
+
+# ---- 事件粒子（潮汐撕裂喷流 / 碎片蒸发尾 / 并合溅射） ----
+PART_GAIN = 2.2             # 基础亮度（HDR，喂 bloom）
+PART_MIN_PX = 0.85          # 最小屏幕半径（像素；远粒子仍可见）
 
 # ---- 天体类型视觉（类型定义与阈值见 physics；此处仅渲染侧） ----
 C_INV_LIGHT2 = 1.0 / C_LIGHT2
@@ -58,6 +64,10 @@ PROM_DEPTH = 1.6            # 环拱纵深（×恒星半径，用于深度平滑
 # 激活曲线为钟形（d/rs ≈ CTR 时最强）：盘接触时表面亮度接管无需
 # 填充，分离较远时暗缝隙属自然分离，唯 d/rs≈CTR 的“贴近未融合”
 # 区间凹槽最深、最像“分界线”，填充也最强。
+# 近距星对由 CPU 每帧筛选上传（state.fuse_*，≤MAX_FUSE 对）——
+# N 体时 O(N²) 逐对扫描对每像素过重。
+MAX_FUSE = 12               # 同时参与融合辉光的星对上限（state.fuse_* 槽位数）
+FUSE_RANGE = 3.0           # 星对筛选距离（×两星半径和；超出无可见贡献）
 FUSE_CTR = 1.22             # 填充峰值距离（×两星半径和，实测凹槽最深处）
 FUSE_WID = 0.46             # 钟形宽度（×两星半径和）
 FUSE_CUT = 0.004            # 早退阈值（低于此贡献跳过计算）
